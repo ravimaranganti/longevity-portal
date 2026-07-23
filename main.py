@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Query, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
-
+from database import create_or_get_user, create_order as db_create_order
 load_dotenv()
 
 LABSTACK_BASE_URL = os.getenv("LABSTACK_BASE_URL", "https://integration.labstack.in/api/v1.3").rstrip("/")
@@ -75,8 +75,15 @@ async def create_order(
     address: str = Form(...),
     collection_date: str = Form(...),
     slot: str = Form(...),
-    lab_id: str = Form(None)  # <--- Added lab_id
+    lab_id: str = Form(None)
 ):
+    # 1. Get existing user or create user profile in Firestore (with full_name included)
+    user = create_or_get_user(
+        phone_number=phone, 
+        pincode=pincode, 
+        full_name=full_name
+    )
+
     url = f"{LABSTACK_BASE_URL}/order/create"
     headers = {
         "ls-api-key": LABSTACK_API_KEY,
@@ -87,24 +94,43 @@ async def create_order(
 
     order_payload = {
         "package_id": DEFAULT_PACKAGE["id"],
-        "lab_id": lab_id,  # <--- Included in LabStack payload
+        "lab_id": lab_id,
         "customer": {"name": full_name, "phone": phone, "pincode": pincode, "address": address},
         "scheduling": {"date": collection_date, "slot": slot},
         "price": DEFAULT_PACKAGE["price"]
     }
 
+    labstack_order_id = None
+
+    # Try live LabStack API call
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(url, headers=headers, json=order_payload, timeout=10.0)
             if response.status_code in [200, 201]:
                 res_data = response.json()
-                return JSONResponse(content={"status": True, "order_id": res_data.get("order_id", "LS-SUCCESS"), "message": "Order created successfully!"}, status_code=200)
+                labstack_order_id = res_data.get("order_id", "LS-SUCCESS")
         except Exception:
             pass
 
-    # Fallback response for sandbox development
-    return JSONResponse(content={
-        "status": True,
-        "order_id": f"LS-SANDBOX-{phone[-4:]}",
-        "message": f"Phlebotomist collection scheduled successfully with lab partner ({lab_id or 'Auto-assigned'})!"
-    }, status_code=200)
+    # Fallback ID for sandbox development if API is offline/fails
+    if not labstack_order_id:
+        labstack_order_id = f"LS-SANDBOX-{phone[-4:]}"
+
+    # 2. Persist order in Firestore linked to the user ID
+    firestore_order_id = db_create_order(
+        user_id=user["id"],
+        labstack_order_id=labstack_order_id,
+        lab_partner=lab_id or "Auto-assigned",
+        items=[DEFAULT_PACKAGE.get("id", "Longevity Panel")]
+    )
+
+    return JSONResponse(
+        content={
+            "status": True,
+            "order_id": labstack_order_id,
+            "firestore_id": firestore_order_id,
+            "user_id": user["id"],
+            "message": f"Phlebotomist collection scheduled successfully with lab partner ({lab_id or 'Auto-assigned'})!"
+        },
+        status_code=200
+    )
